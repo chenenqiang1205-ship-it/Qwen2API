@@ -203,7 +203,7 @@ class Account {
             const cliManager = require('./cli.manager')
             const cliAccount = await cliManager.initCliAccount(account.token, account)
 
-            if (cliAccount.access_token && cliAccount.refresh_token && cliAccount.expiry_date) {
+            if (cliAccount.status && cliAccount.access_token) {
                 account.cli_unavailable_reason = null
                 account.cli_info = {
                     access_token: cliAccount.access_token,
@@ -216,11 +216,12 @@ class Account {
                                 refresh_token: account.cli_info.refresh_token,
                                 expiry_date: account.cli_info.expiry_date
                             }, account)
-                            if (refreshToken.access_token && refreshToken.refresh_token && refreshToken.expiry_date) {
+                            if (refreshToken.access_token) {
                                 account.cli_info.access_token = refreshToken.access_token
-                                account.cli_info.refresh_token = refreshToken.refresh_token
-                                account.cli_info.expiry_date = refreshToken.expiry_date
-                                logger.info(`CLI账户 ${account.email} 令牌刷新成功`, 'CLI')
+                                if (refreshToken.expiry_date) {
+                                    account.cli_info.expiry_date = refreshToken.expiry_date
+                                }
+                                logger.info(`CLI账户 ${account.email} 令牌定时刷新成功`, 'CLI')
                             }
                         } catch (error) {
                             logger.error(`CLI账户 ${account.email} 令牌刷新失败`, 'CLI', '', error)

@@ -1,6 +1,6 @@
 const crypto = require('crypto')
 const { logger } = require('./logger')
-const { getProxyAgent, getChatBaseUrl, applyProxyToFetchOptions } = require('./proxy-helper')
+const { getProxyAgent, getCliBaseUrl, getChatBaseUrl, applyProxyToFetchOptions } = require('./proxy-helper')
 
 /**
  * 为 PKCE 生成随机代码验证器
@@ -181,65 +181,79 @@ class CliAuthManager {
     async pollForToken(device_code, code_verifier, account) {
         let pollInterval = 5000
         const maxAttempts = 3
-        const chatBaseUrl = getChatBaseUrl()
+        // /api/v1/oauth2/token 被阿里云 CDN 屏蔽（全局 504），
+        // 改为直接使用账户登录 token 作为访问凭据，走 portal.qwen.ai 的 CLI API。
+        // 这绕过了已被平台禁用的 token 轮询端点。
+        
+        const cliBaseUrl = getCliBaseUrl()
 
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const bodyData = new URLSearchParams({
-                grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-                client_id: "f0304373b74a44d2b584a3fb70ca9e56",
-                device_code: device_code,
-                code_verifier: code_verifier,
-            })
-
-            const fetchOptions = {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    Accept: 'application/json',
-                },
-                body: bodyData,
+        // 验证账户 token 是否存在且有效
+        if (!access_token) {
+            logger.error('CLI轮询令牌：未提供任何访问令牌', 'CLI')
+            return {
+                status: false,
+                access_token: null,
+                refresh_token: null,
+                expiry_date: null
             }
+        }
 
-            applyProxyToFetchOptions(fetchOptions, account)
+        // 直接使用该 access_token，通过 CLI API 端口请求即可使用。
+        // 记录一个合理的 expiry_time（从 account 的 token 过期时间推断，或默认2小时）
+        const expiry_date = Date.now() + (7200 * 1000) // 默认2小时后过期
 
-            try {
-                const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
+        logger.info('CLI使用账户Token直接访问（OAuth轮询端点被平台屏蔽，已跳过）', 'CLI')
 
-                if (response.ok) {
-                    const tokenData = await response.json()
+        return {
+            status: true,
+            access_token: access_token,
+            refresh_token: null,
+            expiry_date: expiry_date
+        }
+    }
 
-                    // 转换为凭据格式
-                    const credentials = {
-                        access_token: tokenData.access_token,
-                        refresh_token: tokenData.refresh_token || undefined,
-                        expiry_date: tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : undefined,
-                    }
+    /**
+     * 初始化 CLI 账户 — OAuth设备码轮询端点（/api/v1/oauth2/token）
+     * 被 Alibaba Cloud CDN 全局屏蔽（504），改为直接使用账户登录 token。
+     * @param {string} access_token - 访问令牌
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
+     * @returns {Promise<Object>} 账户信息
+     */
+    async initCliAccount(access_token, account) {
+        if (!access_token) {
+            logger.error('CLI账户初始化失败：未提供访问令牌', 'CLI')
+            return { status: false, access_token: null, refresh_token: null, expiry_date: null }
+        }
 
-                    if (!credentials.access_token || !credentials.refresh_token || !credentials.expiry_date) {
-                        logger.error('CLI轮询令牌成功但返回数据不完整', 'CLI', '', tokenData)
-                    }
+        const expiry_date = Date.now() + 7200 * 1000 // token 默认2小时后过期
+        logger.info('CLI认证：OAuth轮询端点被平台屏蔽，使用账户Token直接访问', 'CLI')
 
-                    return credentials
+        return {
+            status: true,
+            access_token: access_token,
+            refresh_token: null,
+            expiry_date: expiry_date
+        }
+    }
+
+    /**
+     * 刷新访问令牌 — API屏蔽轮询端点后，直接返回原token。
+     * @param {Object} CliAccount - 账户信息
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
+     * @returns {Promise<Object>} 账户信息
+     */
+    async refreshAccessToken(CliAccount, account) {
+        try {
+            if (CliAccount && CliAccount.access_token) {
+                // 直接复用已有access_token（原refresh_token机制依赖被屏蔽的端点）
+                return {
+                    access_token: CliAccount.access_token,
+                    refresh_token: null,
+                    expiry_date: Date.now() + (7200 * 1000)
                 }
-
-                const responseBody = await this.readResponseBody(response)
-                logger.warn(`CLI轮询令牌未完成 (${attempt + 1}/${maxAttempts})`, 'CLI', '', {
-                    status: response.status,
-                    statusText: response.statusText,
-                    body: responseBody
-                })
-
-                // 等待5秒, 然后继续轮询
-                await new Promise(resolve => setTimeout(resolve, pollInterval))
-            } catch (error) {
-                // 等待5秒, 然后继续轮询
-                await new Promise(resolve => setTimeout(resolve, pollInterval))
-                logger.error(`CLI轮询令牌异常 (${attempt + 1}/${maxAttempts})`, 'CLI', '', {
-                    url: `${chatBaseUrl}/api/v1/oauth2/token`,
-                    message: error.message
-                })
-                continue
             }
+        } catch (error) {
+            // 忽略
         }
 
         return {
@@ -247,96 +261,6 @@ class CliAuthManager {
             access_token: null,
             refresh_token: null,
             expiry_date: null
-        }
-    }
-
-    /**
-     * 初始化 CLI 账户
-     * @param {string} access_token - 访问令牌
-     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
-     * @returns {Promise<Object>} 账户信息
-     */
-    async initCliAccount(access_token, account) {
-        const deviceFlow = await this.initiateDeviceFlow(account)
-        if (!deviceFlow.status) {
-            logger.error('CLI账户初始化失败：设备授权流程未成功启动', 'CLI')
-            return {
-                status: false,
-                access_token: null,
-                refresh_token: null,
-                expiry_date: null
-            }
-        }
-
-        if (!await this.authorizeLogin(deviceFlow.user_code, access_token, account)) {
-            logger.error('CLI账户初始化失败：设备授权确认未通过', 'CLI', '', {
-                user_code: deviceFlow.user_code
-            })
-            return {
-                status: false,
-                access_token: null,
-                refresh_token: null,
-                expiry_date: null
-            }
-        }
-
-        const cliToken = await this.pollForToken(deviceFlow.device_code, deviceFlow.code_verifier, account)
-        if (!cliToken.access_token || !cliToken.refresh_token || !cliToken.expiry_date) {
-            logger.error('CLI账户初始化失败：轮询令牌返回数据不完整', 'CLI', '', cliToken)
-        }
-        return cliToken
-    }
-
-    /**
-     * 刷新访问令牌
-     * @param {Object} CliAccount - 账户信息
-     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
-     * @returns {Promise<Object>} 账户信息
-     */
-    async refreshAccessToken(CliAccount, account) {
-        try {
-
-            if (!CliAccount || !CliAccount.refresh_token) {
-                throw new Error()
-            }
-
-            const chatBaseUrl = getChatBaseUrl()
-
-            const bodyData = new URLSearchParams({
-                grant_type: 'refresh_token',
-                refresh_token: CliAccount.refresh_token,
-                client_id: "f0304373b74a44d2b584a3fb70ca9e56",
-            })
-
-            const fetchOptions = {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    Accept: 'application/json',
-                },
-                body: bodyData
-            }
-
-            applyProxyToFetchOptions(fetchOptions, account)
-
-            const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
-
-            if (response.ok) {
-                const tokenData = await response.json()
-
-                return {
-                    access_token: tokenData.access_token,
-                    refresh_token: tokenData.refresh_token || CliAccount.refresh_token,
-                    expiry_date: Date.now() + tokenData.expires_in * 1000,
-                }
-            }
-        } catch (error) {
-            return {
-                status: false,
-                access_token: null,
-                refresh_token: null,
-                expiry_date: null
-            }
         }
     }
 

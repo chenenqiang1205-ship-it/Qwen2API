@@ -1,7 +1,22 @@
 const axios = require('axios')
 const { logger } = require('../utils/logger')
 const accountManager = require('../utils/account')
-const { getProxyAgent, getCliBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { getProxyAgent, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { generateUUID } = require('../utils/tools')
+
+// 直接从 request.js 复用聊天请求机制（SSXMOD cookie + chat_id 创建流程）
+// CLI 不再尝试独立的 OAuth 设备码流程（portal.qwen.ai 已死），而是通过
+// chat.qwen.ai 与聊天控制器完全一致的认证管道发送请求。
+
+const request = require('../utils/request')
+
+// 直接从 request.js 复用聊天请求机制（SSXMOD cookie + chat_id 创建流程）。
+// CLI 不再尝试独立的 OAuth 设备码流程（portal.qwen.ai 已死），而是通过
+// chat.qwen.ai 与聊天控制器完全一致的认证管道发送请求。
+
+const isJson = (obj) => obj && typeof obj === 'object'
+
+module.exports = isJson
 
 /**
  * 静默累计 CLI daily stats——异常不影响响应
@@ -282,105 +297,54 @@ function formatCliJsonResponse(data, fallbackModel) {
  */
 const handleCliChatCompletion = async (req, res) => {
     try {
-        const access_token = req.account.cli_info.access_token
         const body = preprocessCliRequestBody(req.body)
         const isStream = body.stream === true
 
-        // 打印当前使用的账号邮箱
         logger.info(`CLI请求使用账号[${req.account.email}]开始处理`, 'CLI', '🚀')
-
-        // 无论成功失败都增加请求计数
         req.account.cli_info.request_number++
 
-        const cliBaseUrl = getCliBaseUrl()
-        const proxyAgent = getProxyAgent(req.account)
-
-        // 设置请求配置
-        const axiosConfig = {
-            method: 'POST',
-            url: `${cliBaseUrl}/v1/chat/completions`,
-            headers: {
-                'Authorization': `Bearer ${access_token}`,
-                'Content-Type': 'application/json',
-                'Accept': isStream ? 'text/event-stream' : 'application/json',
-                'User-Agent': 'QwenCode/0.10.3 (darwin; arm64)',
-                'X-Dashscope-Useragent': 'QwenCode/0.10.3 (darwin; arm64)',
-                'X-Stainless-Runtime-Version': 'v22.17.0',
-                'Sec-Fetch-Mode': 'cors',
-                'X-Stainless-Lang': 'js',
-                'X-Stainless-Arch': 'arm64',
-                'X-Stainless-Package-Version': '5.11.0',
-                'X-Dashscope-Cachecontrol': 'enable',
-                'X-Stainless-Retry-Count': '0',
-                'X-Stainless-Os': 'MacOS',
-                'X-Dashscope-Authtype': 'qwen-oauth',
-                'X-Stainless-Runtime': 'node'
-            },
-            data: body,
-            timeout: 5 * 60 * 1000,
-            validateStatus: function () {
-                return true
-            }
+        // 通过 request.js 发送聊天请求（与 /v1/chat/completions 相同的通道）。
+        const account = { ...req.account }
+        if (req.account.cli_info && req.account.cli_info.access_token) {
+            account.token = req.account.cli_info.access_token
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            axiosConfig.httpsAgent = proxyAgent
-            axiosConfig.proxy = false
+        const result = await request.sendChatRequest({ ...body, stream: true })
+
+        if (!result.status) {
+            logger.error(`CLI请求使用账号[${req.account.email}]处理失败 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥', result)
+            accountManager.recordAccountFailure(req.account.email, null)
+            return res.status(503).json({ error: { message: 'connection_error', type: 'connection_error', code: 503 } })
         }
 
-        // 如果是流式请求，设置响应类型为流
-        if (isStream) {
-            axiosConfig.responseType = 'stream'
+        // 调试：log the first few bytes of response to see if it's SSE or WAF JSON
+        let buffer = ''
+        const isSSE = result.response && typeof result.response.on === 'function'
 
-            // 设置响应头为流式
+        if (isSSE) {
+            // 设置响应头
             res.setHeader('Content-Type', 'text/event-stream')
             res.setHeader('Cache-Control', 'no-cache')
             res.setHeader('Connection', 'keep-alive')
-            res.setHeader('Access-Control-Allow-Origin', '*')
-            res.setHeader('Access-Control-Allow-Headers', '*')
-        }
 
-        const response = await axios(axiosConfig)
-
-        // 检查响应状态
-        if (response.status !== 200) {
-            const errorDetails = await normalizeCliErrorDetails(response.data)
-            logger.error(`CLI请求使用账号[${req.account.email}]转发失败 - 状态码: ${response.status} - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌', {
-                status: response.status,
-                statusText: response.statusText,
-                requestBody: body,
-                details: errorDetails
-            })
-            // HTTP 4xx/5xx——仅刷新 warn 指示, 不影响 cooldown（账户本身有效, 是上游主动拒绝）
-            accountManager.recordAccountError(req.account.email, response.status)
-            return res.status(response.status).json({
-                error: {
-                    message: `api_error`,
-                    type: 'api_error',
-                    code: response.status,
-                    details: errorDetails
-                }
-            })
-        }
-
-        // 处理流式响应
-        if (isStream) {
-            // 缓冲 SSE 解析——usage 帧可能跨 TCP 块（仅 split('\n\n') 会丢失），
-            // 沿用 chat.js/anthropic.js 的 buffer + while indexOf('\n\n') 模式
             let sseBuffer = ''
             let cliUsage = null
 
-            response.data.on('data', (chunk) => {
+            result.response.on('data', (chunk) => {
                 const text = chunk.toString('utf8')
-                // 透传客户端: 逐行回写，保持原有行为
+                buffer += text
+                if (buffer.length > 500) {
+                    res.write(`${line}\n\n`)
+                }
+
+                // 尝试当作 SSE 处理
                 const lines = text.split('\n')
                 for (const line of lines) {
                     if (!line || !line.startsWith('data:')) continue
                     res.write(`${line}\n\n`)
                 }
 
-                // 解析 usage 帧（带缓冲——帧可能被分块切开）
+                // 解析 usage 帧
                 sseBuffer += text
                 let idx
                 while ((idx = sseBuffer.indexOf('\n\n')) !== -1) {
@@ -392,81 +356,58 @@ const handleCliChatCompletion = async (req, res) => {
                     try {
                         const parsed = JSON.parse(payload)
                         if (parsed?.usage) cliUsage = parsed.usage
-                    } catch (e) {
-                        // 部分/非法 JSON——继续累计
-                    }
+                    } catch (e) { /* 忽略 */ }
+                }
+
+                // 如果不是 SSE 格式，而是 WAF JSON，则透传原始响应
+                if (!text.includes('data:') && (text.includes('FAIL') || text.includes('choices'))) {
+                    logger.warn(`CLI检测到非SSE响应（可能是WAF），转为透传`, 'CLI')
+
+                    // 发送完整 body
+                    res.write(text)
+                    res.end()
+                    return
                 }
             })
 
-            // 处理流错误
-            response.data.on('error', (streamError) => {
+            result.response.on('error', (streamError) => {
                 logger.error(`CLI请求使用账号[${req.account.email}]流式传输失败 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌')
-                // 传输错误——记 failure（影响 cooldown）
                 accountManager.recordAccountFailure(req.account.email, streamError?.code)
                 if (!res.headersSent) {
-                    res.status(500).json({
-                        error: {
-                            message: 'stream_error',
-                            type: 'stream_error',
-                            code: 500
-                        }
-                    })
+                    res.status(500).json({ error: { message: 'stream_error', type: 'stream_error', code: 500 } })
                 }
             })
 
-            // 处理流结束
-            response.data.on('end', () => {
-                logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
-                attributeCliUsage(req.account.email, cliUsage)
-                res.end()
+            result.response.on('end', () => {
+                // 如果 buffer 中有内容但没通过 SSE 写出（非SSE格式）
+                if (buffer && !res.headersSent) {
+                    logger.warn(`CLI将非SSE响应透传为JSON`, 'CLI')
+                    res.json(JSON.parse(buffer.split('.').slice(0, 1).join('.') || '{}'))
+                } else {
+                    logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+                    res.end()
+                }
             })
-        } else {
-            // 处理JSON响应
-            const cliUsage = response.data?.usage
-            res.json(formatCliJsonResponse(response.data, body.model))
-            logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (JSON) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
-            attributeCliUsage(req.account.email, cliUsage)
         }
-    } catch (error) {
-        logger.error(`CLI请求使用账号[${req.account.email}]处理异常 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥', {
-            requestBody: body,
-            ...(await buildCliAxiosErrorLog(error))
+
+        rawData.on('error', (streamError) => {
+            logger.error(`CLI请求使用账号[${req.account.email}]流式传输失败 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌')
+            accountManager.recordAccountFailure(req.account.email, streamError?.code)
+            if (!res.headersSent) {
+                res.status(500).json({ error: { message: 'stream_error', type: 'stream_error', code: 500 } })
+            }
         })
-        // catch 路径——区分传输错误（cooldown）与 HTTP 错误（warn-only）
-        if (error?.response) {
-            accountManager.recordAccountError(req.account.email, error.response.status)
-        } else {
-            accountManager.recordAccountFailure(req.account.email, error?.code)
-        }
 
-        // 如果是axios错误，提供更详细的错误信息
-        if (error.response) {
-            const errorDetails = await normalizeCliErrorDetails(error.response.data)
-            return res.status(error.response.status).json({
-                error: {
-                    message: "api_error",
-                    type: 'api_error',
-                    code: error.response.status,
-                    details: errorDetails
-                }
-            })
-        } else if (error.request) {
-            return res.status(503).json({
-                error: {
-                    message: 'connection_error',
-                    type: 'connection_error',
-                    code: 503
-                }
-            })
-        } else {
-            return res.status(500).json({
-                error: {
-                    message: 'internal_error',
-                    type: 'internal_error',
-                    code: 500
-                }
-            })
-        }
+        rawData.on('end', () => {
+            logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+            attributeCliUsage(req.account.email, cliUsage)
+            res.end()
+        })
+
+    } catch (error) {
+        logger.error(`CLI请求使用账号[${req.account.email}]处理异常 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥')
+        accountManager.recordAccountFailure(req.account.email, error?.code)
+        return res.status(503).json({ error: { message: 'connection_error', type: 'connection_error', code: 503 } })
     }
 }
 
