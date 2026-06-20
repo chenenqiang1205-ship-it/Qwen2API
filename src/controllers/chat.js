@@ -105,6 +105,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         let thinking_end = false
         let emittedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
+        let reasoningContent = '' // 收集思考内容用于 reasoning_content 字段
 
         const hasTools = !!options.has_tools
         const toolChoice = options.tool_choice
@@ -145,6 +146,26 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     {
                         "index": 0,
                         "delta": { "content": text },
+                        "finish_reason": null
+                    }
+                ]
+            })}\n\n`)
+        }
+
+        /**
+         * 写一个思考内容增量（reasoning_content 字段）
+         * @param {string} text - 思考内容
+         */
+        const writeReasoningDelta = (text) => {
+            if (!text) return
+            res.write(`data: ${JSON.stringify({
+                "id": `chatcmpl-${message_id}`,
+                "object": "chat.completion.chunk",
+                "created": Math.round(new Date().getTime() / 1000),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": { "reasoning_content": text },
                         "finish_reason": null
                     }
                 ]
@@ -257,32 +278,48 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 }
             }
 
+            // 处理上游直接发送的 reasoning_content 字段（OMLX 风格）
+            if (delta && delta.reasoning_content !== undefined) {
+                const rc = delta.reasoning_content
+                reasoningContent += rc
+                writeReasoningDelta(rc)
+                return
+            }
+
             if (!delta || !delta.content ||
                 (delta.phase !== 'think' && delta.phase !== 'answer')) {
                 return
             }
 
             let content = delta.content
-            completionContent += content
 
-            if (delta.phase === 'think' && !thinking_start) {
-                thinking_start = true
-                if (web_search_info) {
-                    content = `<think>\n\n${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n${content}`
+            if (delta.phase === 'think') {
+                // 思考阶段：收集思考内容并通过 reasoning_content 字段发送
+                if (web_search_info && !thinking_start) {
+                    thinking_start = true
+                    const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
+                    reasoningContent = webSearchTable + '\n\n' + content
                 } else {
-                    content = `<think>\n\n${content}`
+                    if (!thinking_start) thinking_start = true
+                    reasoningContent += content
                 }
+                writeReasoningDelta(content)
+                return
             }
-            if (delta.phase === 'answer' && !thinking_end && thinking_start) {
-                thinking_end = true
+
+            if (delta.phase === 'answer') {
+                // 回答阶段：如果之前有思考内容，先结束思考阶段
+                if (!thinking_end && thinking_start) {
+                    thinking_end = true
+                }
+                completionContent += content
+
                 if (pendingImageMarkdownList.length > 0) {
                     const pendingImageContent = `${pendingImageMarkdownList.join('\n\n')}\n\n`
-                    content = `\n\n</think>\n${pendingImageContent}${content}`
+                    content = `${pendingImageContent}${content}`
                     completionContent += pendingImageContent
                     pendingImageMarkdownList.forEach(item => emittedImageMarkdownSet.add(item))
                     pendingImageMarkdownList = []
-                } else {
-                    content = `\n\n</think>\n${content}`
                 }
             }
 
@@ -368,6 +405,30 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             if (tail.completedCalls.length > 0) writeToolCallsDelta(tail.completedCalls)
         }
 
+        // 如果只有 reasoning_content 没有 content，从 reasoning_content 提取回答作为 content
+        if (reasoningContent && !completionContent) {
+            const responsePatterns = [
+                /(?:^|\n)\s*(?:Final )?(?:\*{0,2})?(?:Selected )?[Rr]esponse(?:\*{0,2})?:\s*[""「」\x22](.+?)[""「」\x22]/ms,
+                /(?:^|\n)\s*(?:Final )?(?:\*{0,2})?(?:Selected )?[Rr]esponse(?:\*{0,2})?:\s*(.+?)$/ms,
+                /(?:^|\n)\s*(?:Final )?(?:\*{0,2})?[Oo]utput(?:\*{0,2})?:\s*(.+?)$/ms,
+                /(?:^|\n)\s*(?:Final )?[Rr]esponse:\s*[""「」\x22](.+?)[""「」\x22]/ms,
+                /(?:^|\n)\s*(?:Final )?[Rr]esponse:\s*(.+?)$/ms,
+                /(?:^|\n)\s*回答:\s*(.+?)$/ms,
+                /(?:^|\n)\s*回复:\s*(.+?)$/ms,
+                /(?:^|\n)\s*Result:\s*(.+?)$/ms
+            ]
+            for (const pattern of responsePatterns) {
+                const match = reasoningContent.match(pattern)
+                if (match && match[1]) {
+                    let extractedContent = match[1].trim()
+                    extractedContent = extractedContent.replace(/^[\*\-\s]+/, '')
+                    completionContent = extractedContent
+                    writeContentDelta(extractedContent)
+                    break
+                }
+            }
+        }
+
         // 处理最终的搜索信息
         if ((config.outThink === false || !enable_thinking) && web_search_info && config.searchInfoMode === "text") {
             const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, "text")
@@ -435,6 +496,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
 const handleNonStreamResponse = async (res, response, enable_thinking, enable_web_search, model, requestBody = null, options = {}) => {
     try {
         let fullContent = ''
+        let reasoningContent = '' // 收集思考内容用于 reasoning_content 字段
         let web_search_info = null
         let thinking_start = false
         let thinking_end = false
@@ -532,6 +594,11 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                             }
                         }
 
+                        if (delta && delta.reasoning_content !== undefined) {
+                            reasoningContent += delta.reasoning_content
+                            continue
+                        }
+
                         if (!delta || !delta.content ||
                             (delta.phase !== 'think' && delta.phase !== 'answer')) {
                             continue
@@ -539,27 +606,28 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
 
                         let content = delta.content
 
-                        if (delta.phase === 'think' && !thinking_start) {
-                            thinking_start = true
-                            if (web_search_info) {
+                        if (delta.phase === 'think') {
+                            if (!thinking_start) thinking_start = true
+                            if (web_search_info && reasoningContent === '') {
                                 const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
-                                content = `<think>\n\n${webSearchTable}\n\n${content}`
+                                reasoningContent = webSearchTable + '\n\n' + content
                             } else {
-                                content = `<think>\n\n${content}`
+                                reasoningContent += content
                             }
-                        }
-                        if (delta.phase === 'answer' && !thinking_end && thinking_start) {
-                            thinking_end = true
-                            if (pendingImageMarkdownList.length > 0) {
-                                content = `\n\n</think>\n${pendingImageMarkdownList.join('\n\n')}\n\n${content}`
-                                pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
-                                pendingImageMarkdownList = []
-                            } else {
-                                content = `\n\n</think>\n${content}`
-                            }
+                            continue
                         }
 
-                        fullContent += content
+                        if (delta.phase === 'answer') {
+                            if (!thinking_end && thinking_start) {
+                                thinking_end = true
+                            }
+                            if (pendingImageMarkdownList.length > 0) {
+                                content = `${pendingImageMarkdownList.join('\n\n')}\n\n${content}`
+                                pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
+                                pendingImageMarkdownList = []
+                            }
+                            fullContent += content
+                        }
                     } catch (error) {
                         logger.error('非流式数据处理错误', 'CHAT', '', error)
                     }
@@ -633,7 +701,33 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         // Daily stats 累计——一次性归属到主请求账户（同 stream 分支注释）
         attributeChatUsage(options.currentAccount, totalTokens)
 
-        const assistantMessage = { role: 'assistant', content: assistantContent || null }
+        // 如果 content 为空但 reasoning_content 有内容，尝试从 reasoning_content 提取回答
+        let finalContent = assistantContent
+        if (!finalContent && reasoningContent) {
+            const responsePatterns = [
+                /(?:^|\n)\s*(?:Final )?(?:\*{0,2})?(?:Selected )?[Rr]esponse(?:\*{0,2})?:\s*[""「」\x22](.+?)[""「」\x22]/ms,
+                /(?:^|\n)\s*(?:Final )?(?:\*{0,2})?(?:Selected )?[Rr]esponse(?:\*{0,2})?:\s*(.+?)$/ms,
+                /(?:^|\n)\s*(?:Final )?(?:\*{0,2})?[Oo]utput(?:\*{0,2})?:\s*(.+?)$/ms,
+                /(?:^|\n)\s*(?:Final )?[Rr]esponse:\s*[""「」\x22](.+?)[""「」\x22]/ms,
+                /(?:^|\n)\s*(?:Final )?[Rr]esponse:\s*(.+?)$/ms,
+                /(?:^|\n)\s*回答:\s*(.+?)$/ms,
+                /(?:^|\n)\s*回复:\s*(.+?)$/ms,
+                /(?:^|\n)\s*Result:\s*(.+?)$/ms
+            ]
+            for (const pattern of responsePatterns) {
+                const match = reasoningContent.match(pattern)
+                if (match && match[1]) {
+                    finalContent = match[1].trim().replace(/^[\*\-\s]+/, '')
+                    break
+                }
+            }
+        }
+
+        const assistantMessage = { role: 'assistant', content: finalContent || null }
+        // 如果有思考内容，添加 reasoning_content 字段（OMLX 风格）
+        if (reasoningContent) {
+            assistantMessage.reasoning_content = reasoningContent
+        }
         if (toolCalls.length > 0) {
             assistantMessage.tool_calls = toolCalls
         }
