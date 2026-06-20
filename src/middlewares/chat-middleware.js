@@ -48,10 +48,11 @@ const processRequestBody = async (req, res, next) => {
         feature_config: {
           thinking_enabled: thinkingConfig.thinking_enabled,
           research_mode: 'normal',
-          auto_thinking: true,
-          thinking_mode: 'Auto',
-          thinking_format: 'detail',
-          auto_search: true
+          auto_thinking: thinkingConfig.thinking_enabled,
+          thinking_mode: thinkingConfig.thinking_enabled ? 'Auto' : 'Fast',
+          thinking_format: thinkingConfig.thinking_enabled ? 'detail' : 'summary',
+          auto_search: true,
+          output_schema: thinkingConfig.output_schema
         },
         extra: { meta: { subChatType: isChatType(model) } },
         sub_chat_type: isChatType(model)
