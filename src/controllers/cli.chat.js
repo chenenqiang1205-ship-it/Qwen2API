@@ -3,6 +3,7 @@ const { logger } = require('../utils/logger')
 const accountManager = require('../utils/account')
 const { getProxyAgent, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
 const { generateUUID } = require('../utils/tools')
+const { buildToolSystemPrompt, foldToolMessages, createToolCallStreamParser } = require('../utils/tool-prompt')
 
 // 直接从 request.js 复用聊天请求机制（SSXMOD cookie + chat_id 创建流程）
 // CLI 不再尝试独立的 OAuth 设备码流程（portal.qwen.ai 已死），而是通过
@@ -264,14 +265,30 @@ function preprocessCliRequestBody(rawBody) {
     if (body.model && MODEL_REDIRECT[body.model]) {
         body.model = MODEL_REDIRECT[body.model]
     }
+
+    const hasTools = Array.isArray(body.tools) && body.tools.length > 0
+    let toolSystemPrompt = ''
+    if (hasTools) {
+        toolSystemPrompt = buildToolSystemPrompt(body.tools, { tool_choice: body.tool_choice })
+        body.messages = foldToolMessages(body.messages || [])
+    }
+
     if (Array.isArray(body.messages) && body.messages.length > 0) {
         body.messages = ensureCliSystemMessage(body.messages)
+
+        if (hasTools && toolSystemPrompt) {
+            const systemMsg = body.messages[0]
+            if (systemMsg && systemMsg.role === 'system' && Array.isArray(systemMsg.content)) {
+                systemMsg.content.push({ type: 'text', text: toolSystemPrompt })
+            }
+        }
     }
+
     if (body.stream_options && typeof body.stream_options === 'object' && Object.keys(body.stream_options).length === 0) {
         delete body.stream_options
     }
 
-    return body
+    return { body, hasTools, toolChoice: body.tool_choice || 'auto' }
 }
 
 function formatCliJsonResponse(data, fallbackModel) {
@@ -297,13 +314,12 @@ function formatCliJsonResponse(data, fallbackModel) {
  */
 const handleCliChatCompletion = async (req, res) => {
     try {
-        const body = preprocessCliRequestBody(req.body)
+        const { body, hasTools, toolChoice } = preprocessCliRequestBody(req.body)
         const isStream = body.stream === true
 
         logger.info(`CLI请求使用账号[${req.account.email}]开始处理`, 'CLI', '🚀')
         req.account.cli_info.request_number++
 
-        // 通过 request.js 发送聊天请求（与 /v1/chat/completions 相同的通道）。
         const account = { ...req.account }
         if (req.account.cli_info && req.account.cli_info.access_token) {
             account.token = req.account.cli_info.access_token
@@ -317,34 +333,23 @@ const handleCliChatCompletion = async (req, res) => {
             return res.status(503).json({ error: { message: 'connection_error', type: 'connection_error', code: 503 } })
         }
 
-        // 调试：log the first few bytes of response to see if it's SSE or WAF JSON
         let buffer = ''
         const isSSE = result.response && typeof result.response.on === 'function'
 
         if (isSSE) {
-            // 设置响应头
             res.setHeader('Content-Type', 'text/event-stream')
             res.setHeader('Cache-Control', 'no-cache')
             res.setHeader('Connection', 'keep-alive')
 
             let sseBuffer = ''
             let cliUsage = null
+            const messageId = generateUUID()
+            const toolParser = hasTools ? createToolCallStreamParser() : null
 
             result.response.on('data', (chunk) => {
                 const text = chunk.toString('utf8')
                 buffer += text
-                if (buffer.length > 500) {
-                    res.write(`${line}\n\n`)
-                }
 
-                // 尝试当作 SSE 处理
-                const lines = text.split('\n')
-                for (const line of lines) {
-                    if (!line || !line.startsWith('data:')) continue
-                    res.write(`${line}\n\n`)
-                }
-
-                // 解析 usage 帧
                 sseBuffer += text
                 let idx
                 while ((idx = sseBuffer.indexOf('\n\n')) !== -1) {
@@ -353,17 +358,65 @@ const handleCliChatCompletion = async (req, res) => {
                     if (!frame.startsWith('data:')) continue
                     const payload = frame.slice(frame.indexOf(':') + 1).trim()
                     if (!payload || payload === '[DONE]') continue
+
                     try {
                         const parsed = JSON.parse(payload)
                         if (parsed?.usage) cliUsage = parsed.usage
-                    } catch (e) { /* 忽略 */ }
+
+                        if (toolParser && parsed?.choices?.[0]?.delta?.content) {
+                            const content = parsed.choices[0].delta.content
+                            const parsed2 = toolParser.push(content)
+                            if (parsed2.textDelta) {
+                                parsed.choices[0].delta.content = parsed2.textDelta
+                                res.write(`data: ${JSON.stringify(parsed)}\n\n`)
+                            }
+                            if (parsed2.completedCalls.length > 0) {
+                                for (const call of parsed2.completedCalls) {
+                                    const headerDelta = {
+                                        id: `chatcmpl-${messageId}`,
+                                        object: 'chat.completion.chunk',
+                                        created: Math.round(Date.now() / 1000),
+                                        choices: [{
+                                            index: 0,
+                                            delta: {
+                                                tool_calls: [{
+                                                    index: call.index,
+                                                    id: call.id,
+                                                    type: 'function',
+                                                    function: { name: call.function.name, arguments: '' }
+                                                }]
+                                            },
+                                            finish_reason: null
+                                        }]
+                                    }
+                                    res.write(`data: ${JSON.stringify(headerDelta)}\n\n`)
+
+                                    const args = call.function.arguments || ''
+                                    for (let offset = 0; offset < args.length; offset += 32) {
+                                        const piece = args.slice(offset, offset + 32)
+                                        res.write(`data: ${JSON.stringify({
+                                            id: `chatcmpl-${messageId}`,
+                                            object: 'chat.completion.chunk',
+                                            created: Math.round(Date.now() / 1000),
+                                            choices: [{
+                                                index: 0,
+                                                delta: { tool_calls: [{ index: call.index, function: { arguments: piece } }] },
+                                                finish_reason: null
+                                            }]
+                                        })}\n\n`)
+                                    }
+                                }
+                            }
+                        } else {
+                            res.write(`data: ${JSON.stringify(parsed)}\n\n`)
+                        }
+                    } catch (e) {
+                        res.write(`data: ${payload}\n\n`)
+                    }
                 }
 
-                // 如果不是 SSE 格式，而是 WAF JSON，则透传原始响应
                 if (!text.includes('data:') && (text.includes('FAIL') || text.includes('choices'))) {
                     logger.warn(`CLI检测到非SSE响应（可能是WAF），转为透传`, 'CLI')
-
-                    // 发送完整 body
                     res.write(text)
                     res.end()
                     return
@@ -379,30 +432,57 @@ const handleCliChatCompletion = async (req, res) => {
             })
 
             result.response.on('end', () => {
-                // 如果 buffer 中有内容但没通过 SSE 写出（非SSE格式）
+                attributeCliUsage(req.account.email, cliUsage)
+
+                if (toolParser) {
+                    const tail = toolParser.flush()
+                    if (tail.textDelta) {
+                        res.write(`data: ${JSON.stringify({
+                            id: `chatcmpl-${messageId}`,
+                            object: 'chat.completion.chunk',
+                            created: Math.round(Date.now() / 1000),
+                            choices: [{ index: 0, delta: { content: tail.textDelta }, finish_reason: null }]
+                        })}\n\n`)
+                    }
+                }
+
+                const finishReason = (toolParser && toolParser.hasEmittedAnyCall()) ? 'tool_calls' : 'stop'
+                res.write(`data: ${JSON.stringify({
+                    id: `chatcmpl-${messageId}`,
+                    object: 'chat.completion.chunk',
+                    created: Math.round(Date.now() / 1000),
+                    choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+                })}\n\n`)
+
+                if (cliUsage) {
+                    res.write(`data: ${JSON.stringify({
+                        id: `chatcmpl-${messageId}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.round(Date.now() / 1000),
+                        choices: [],
+                        usage: cliUsage
+                    })}\n\n`)
+                }
+
+                res.write('data: [DONE]\n\n')
+
                 if (buffer && !res.headersSent) {
                     logger.warn(`CLI将非SSE响应透传为JSON`, 'CLI')
-                    res.json(JSON.parse(buffer.split('.').slice(0, 1).join('.') || '{}'))
+                    try {
+                        const parsed = JSON.parse(buffer)
+                        res.json(parsed)
+                    } catch (e) {
+                        logger.error(`CLI非SSE响应JSON解析失败`, 'CLI', '', e)
+                        res.json({ error: { message: 'invalid_response', type: 'parse_error', code: 500 } })
+                    }
                 } else {
                     logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
-                    res.end()
+                    if (!res.writableEnded) {
+                        res.end()
+                    }
                 }
             })
         }
-
-        rawData.on('error', (streamError) => {
-            logger.error(`CLI请求使用账号[${req.account.email}]流式传输失败 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌')
-            accountManager.recordAccountFailure(req.account.email, streamError?.code)
-            if (!res.headersSent) {
-                res.status(500).json({ error: { message: 'stream_error', type: 'stream_error', code: 500 } })
-            }
-        })
-
-        rawData.on('end', () => {
-            logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
-            attributeCliUsage(req.account.email, cliUsage)
-            res.end()
-        })
 
     } catch (error) {
         logger.error(`CLI请求使用账号[${req.account.email}]处理异常 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥')

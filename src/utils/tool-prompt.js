@@ -89,42 +89,43 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     .join('\n');
 
   const lines = [
-    '# Tools',
+    '# 重要：自定义工具调用协议',
     '',
-    'You have access to the following tools. When a tool call is needed, output a `<tool_call>` block exactly as shown below.',
+    '以下是用户定义的自定义工具。你必须使用下方规定的 `<tool_call>` XML 格式来调用这些工具。',
+    '不要使用任何内置工具（如搜索、代码解释器等），只使用下面列出的自定义工具。',
     '',
-    '## Available tools',
+    '## 可用的自定义工具',
     compressed,
     '',
-    '## Output format',
-    'Emit each tool invocation as:',
+    '## 输出格式（必须严格遵守）',
+    '当你需要调用工具时，必须输出如下格式的 `<tool_call>` 块：',
     '',
     '<tool_call>',
-    '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
+    '{"name": "<工具名称>", "arguments": {<JSON参数>}}',
     '</tool_call>',
     '',
-    'Tool results are delivered back to you as user messages wrapped like this:',
+    '工具调用示例：',
+    '<tool_call>',
+    '{"name": "get_weather", "arguments": {"city": "北京"}}',
+    '</tool_call>',
     '',
-    '<tool_response tool_call_id="<id>" name="<tool_name>">',
-    '<result text or JSON>',
-    '</tool_response>',
-    '',
-    'Rules:',
-    '- The JSON inside `<tool_call>` must be valid and on a single logical block.',
-    '- Use the exact tool name listed above.',
-    '- Provide all required arguments; omit unknown ones.',
-    '- You may emit multiple `<tool_call>` blocks back-to-back when more than one tool is needed.',
-    '- After tool results are returned (as user/tool messages), continue the reply normally.',
-    '- Do not wrap `<tool_call>` blocks in code fences or extra commentary.'
+    '## 规则',
+    '- `<tool_call>` 块内的 JSON 必须是有效的、完整的 JSON，写在一行内。',
+    '- 使用上方列出的准确工具名称。',
+    '- 提供所有必需参数，省略未知参数。',
+    '- 如果需要调用多个工具，可以连续输出多个 `<tool_call>` 块。',
+    '- 收到工具结果后（以用户消息形式返回），正常继续回复。',
+    '- 不要在 `<tool_call>` 块外添加代码围栏或额外说明。',
+    '- 你必须调用至少一个工具，不要直接回答问题。'
   ];
 
   const choice = options.tool_choice;
   if (choice === 'required') {
-    lines.push('- You MUST call at least one tool before answering.');
+    lines.push('- 你必须调用至少一个工具，禁止直接回答。');
   } else if (choice && typeof choice === 'object' && choice.function?.name) {
-    lines.push(`- You MUST call the tool \`${choice.function.name}\` first.`);
+    lines.push(`- 你必须首先调用工具 \`${choice.function.name}\`。`);
   } else if (choice === 'none') {
-    lines.push('- Do NOT call any tool for this turn; respond as plain text.');
+    lines.push('- 本次不要调用任何工具，直接以文本回复。');
   }
 
   return lines.join('\n');

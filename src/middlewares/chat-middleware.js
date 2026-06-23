@@ -93,7 +93,6 @@ const processRequestBody = async (req, res, next) => {
     body.messages[0].sub_chat_type = chatType
     body.messages[0].feature_config.thinking_enabled = thinkingConfig.thinking_enabled
 
-    // 工具提示词拼接到用户消息内容上
     if (hasTools && toolSystemPrompt) {
       const msgContent = body.messages[0].content
       if (typeof msgContent === 'string') {
